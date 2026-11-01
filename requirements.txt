@@ -4,6 +4,18 @@ uvicorn[standard]>=0.27
 pillow>=10.0
 numpy>=1.26
 
+# Multi-type bench (Part II)
+# opencv: shape features (Hu moments), k-means segmentation, preprocessing
+opencv-python-headless>=4.9
+# rapidocr_onnxruntime: OCR attacker for the text family (PP-OCRv4, ONNX)
+rapidocr-onnxruntime>=1.3
+# onnxruntime: inference backend for RapidOCR and the optional CLIP attacker
+onnxruntime>=1.17
+# CLIP tokenizer dependencies (optional CLIP attacker only)
+ftfy>=6.1
+regex>=2023.0
+huggingface-hub>=0.23
+
 # Testing
 requests>=2.31
 pytest>=8.0

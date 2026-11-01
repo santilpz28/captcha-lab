@@ -20,12 +20,27 @@ El lab tiene **dos mitades** y esa es la idea:
 
 ### Lo que este lab demuestra (con números, no con opinions)
 
+**Parte I — deslizador (drag-to-fit):**
+
 | Métrica | Valor | Qué significa |
 |---|---|---|
 | Solver de CV | **40/40 exactos, 0 px de error** | Un matcher ingenuo encuentra el hueco siempre → la posición nunca fue el problema |
 | Ataques en modo producción | **12/15 bloqueados** | Los 3 que pasan son `humanish`: un ataque indistinguible de una persona |
 | Atribución | **15/15 → AI AGENT, 0 → HUMAN** | El servidor sabe *quién* resolvió, con tokens firmados |
 | Latencia del solver | ~120 ms | Es viable en producción... por eso hace falta el gate de comportamiento |
+
+**Parte II — banco multi-tipo (texto, grid, imagen):**
+
+| Familia | Reto | Exacto | Por unidad | Coste |
+|---|---|---|---|---|
+| text | transcribir caracteres | **87%** | 91% por carácter | ~2,1 s |
+| grid | seleccionar todas las X (3×3) | **87%** | 96% por celda | 5 ms |
+| image | clic en la imagen con X | 33% | 33% | 8 ms |
+
+El hallazgo de la Parte II no es que los retos se rompen —es que **se rompen de
+formas distintas**: el texto cae por el coste de inferencia, el grid por la
+aritmética combinatoria, y la imagen única por la segmentación. Ver
+[Banco multi-tipo](#parte-ii--banco-multi-tipo-de-retos-genericos).
 
 La conclusión es incómoda y es el punto de todo el lab:
 
@@ -397,6 +412,178 @@ LAB_MODE = True          # True: registra pero deja pasar
 
 ---
 
+## Parte II — Banco multi-tipo de retos genéricos
+
+El slider resuelve *una* pregunta: ¿es difícil encontrar la posición del hueco? La
+respuesta fue "no" (40/40, 0 px). Pero un CAPTCHA real no es sólo un deslizador:
+hay texto que transcribir, imágenes que seleccionar y grids con selección múltiple.
+Cada familia tiene una aritmética de fallo distinta, y cada una merece su propio
+número.
+
+Este banco implementa **tres familias adicionales** con el mismo contrato mínimo
+(`generate` → `solve` → `score`), un atacante real por familia, y un harness que
+las mide de forma uniforme.
+
+### El contrato común
+
+```python
+class Family(Protocol):
+    name: str
+    def generate(self, seed: int, **kwargs) -> Challenge: ...
+    def solve(self, challenge: Challenge) -> Attempt: ...
+    def score(self, challenge: Challenge, attempt: Attempt) -> bool: ...
+```
+
+`Challenge.truth` **nunca sale del servidor**; `Challenge.public` es lo único que
+viaja al cliente. El terreno de juego es el mismo para todas las familias.
+
+### Resultados medidos
+
+Ejecutado con `python3 bench.py --runs 30` (seed fijo `20261101`, 30 desafíos por
+familia, CPU local, sin GPU):
+
+| Familia | Reto | Exacto | Por unidad | Coste | Intentos para pasar |
+|---|---|---|---|---|---|
+| **text** | "escribe los caracteres" (4–6) | **87%** | 91% por carácter | ~2,1 s | **1,2** |
+| **grid** | "selecciona todas las imágenes con X" (3×3) | **87%** | 96% por celda | **5 ms** | **1,2** |
+| **image** | "haz clic en la imagen con X" (1 imagen) | 33% | 33% | 8 ms | 3,0 |
+
+Lectura honesta de la tabla:
+
+- **text**: se rompe en ~1,2 intentos. El coste es de inferencia OCR (~2 s), no de
+  ingeniería. Un bucle de reintentos lo resuelve en menos de 3 segundos.
+- **grid**: mismo resultado con 5 ms. Aquí el coste es la **aritmética**, no el
+  modelo — y por eso los dos números se parecen: el atacante es barato, la
+  selección múltiple no.
+- **image**: 33%. El cuello de botella **no es la visión artificial**, es la
+  *segmentación* (encontrar el objeto y clasificarlo por separado). Es un
+  resultado útil: señala dónde está el trabajo difícil.
+
+### El sweep de distorsión (texto)
+
+La calibración importa: una distorsión que nadie usa en producción produce
+números que no dicen nada. Esta tabla es el argumento central del banco.
+
+| Distorsión | Exacto | Por carácter | Intentos | Lectura |
+|---|---|---|---|---|
+| 0.00 | 83% | 89% | 1,2 | Sin distorsión |
+| 0.15 | 87% | 93% | 1,2 | Ruido leve |
+| **0.30** | **87%** | **91%** | **1,2** | **Rango de producción** |
+| 0.45 | 77% | 83% | 1,3 | Agresivo |
+| 0.60 | 57% | 81% | 1,8 | Muy agresivo |
+| 0.80 | 7% | 33% | 15 | Extremo — rompe el OCR |
+| 1.00 | 10% | 18% | 10 | Extremo |
+
+La lectura no es "cuanto más distorsión, mejor". Es: **hasta ~0.45 el reto sigue
+siendo decorativo** (un reintento lo pasa); el cliff real está entre 0.45 y 0.6;
+y por encima de 0.8 el OCR se rompe porque la wave distortion destruye las
+líneas horizontales que el OCR necesita para segmentar — no porque el atacante sea
+mejor, sino porque el reto dejó de ser legible para **los humanos también**.
+
+> **Distorsión no equivale a seguridad.** Un reto que un humano apenas lee y un
+> bot no puede leer es un reto que sólo protege contra el bot que aún no sabe
+> OCR. La primera versión de este banco usaba `distortion=1.0` por defecto y
+> publicaba 13% de acierto. Eso era un número *falso*: describía un CAPTCHA que
+> nadie desplegaría. Los números de arriba son de rangos que un sitio real
+> usaría.
+
+### La aritmética de la selección múltiple (grid)
+
+Éste es el resultado que sostiene todo el banco. El atacante mantiene su precisión
+por celda (~93%) mientras el acierto **completo** se desploma:
+
+| Celdas objetivo | Exacto | Por celda | Intentos |
+|---|---|---|---|
+| 1 | 87% | 90% | 1,2 |
+| 2 | 87% | 93% | 1,2 |
+| 3 | 77% | 93% | 1,3 |
+| 4 | 67% | 93% | 1,5 |
+| 5 | 63% | 93% | 1,6 |
+| 6 | 67% | 94% | 1,5 |
+
+**Un clasificador con 93% de precisión por celda sólo resuelve el reto completo
+el 63-67% de las veces.** El motivo está en los datos de fallo: de los 4 desafíos
+fallados en la corrida de 30, **todos fueron falsos positivos** — el atacante
+seleccionó celdas que no contenían el objetivo. Con selección múltiple, cada
+error se paga dos veces: un fallo de más (falso positivo) y el acierto completo
+exige acertar *todas* las celdas.
+
+Ésta es la lección de auditoría que un cliente compra: **subir la calidad del
+clasificador no escala**. Un modelo con 99% por celda aún deja un 6% de
+desviación global en un grid de 6, y ese 6% se multiplica por el número de
+intentos que un atacante está dispuesto a hacer (gratis, si el fallo no cuesta
+nada). Lo que protege de verdad es el **coste por intento**, la telemetría y el
+gate de comportamiento — no la precisión del modelo.
+
+### Los atacantes (y por qué son conservadores)
+
+| Familia | Atacante | Nota de honestidad |
+|---|---|---|
+| text | RapidOCR (PP-OCRv4, ONNX, sin API) + preprocesado | Atacante *mundano*. Un VLM moderno sube la cifra. |
+| grid | Hu moments + fill ratio + aspect ratio | Deliberadamente modesto. Una CNN lo supera. |
+| image | Segmentación por k-means de hue + clasificador de formas | El más débil, y eso es un hallazgo, no una excusa. |
+| grid (opt-in) | CLIP ViT-B/32 fp16 (ONNX) | 2,7 s/img en CPU → inviable como default. Documentado, no medición principal. |
+
+Todos son **conservadores**: describen el *suelo* de lo que un atacante
+modesto consigue, no el techo. Un banco que mide al atacante más débil posible
+exagera la resistencia del reto; uno que mide al más fuerte infla la amenaza.
+Aquí se reporta el atacante barato, que es el que basta para romper el reto.
+
+### CLIP: por qué es opt-in
+
+CLIP funciona (el tokenizer BPE propio, los casts fp16, las entradas correctas
+del export ONNX), pero a **2,7 s por imagen en CPU** — fp16 emulado, sin
+aceleración. Un grid de 3×3 serían 24 s. Además, sobre formas sintéticas
+abstractas sus confianzas rondan 0,4-0,5: **no discrimina**, porque no son
+fotos. Un modelo entrenado sobre el dominio real es lo que gana aquí, y fingir lo
+contrario con formas dibujadas sería trampa.
+
+El modelo se descarga bajo demanda a `~/.cache/captcha-lab/models` (~300 MB) y
+**no se versiona**: el repo sigue siendo pequeño y el banco degrada con elegancia
+a los clasificadores clásicos si el modelo no está.
+
+### Ejecutar el banco
+
+```bash
+python3 bench.py                          # 30 runs por familia
+python3 bench.py --runs 50 --seed 12345   # reproducible con otra seed
+python3 bench.py --sweep                  # tabla de distorsión del texto
+python3 bench.py --scaling                # curva de escalado del grid
+python3 bench.py --json out/bench.json    # salida machine-readable
+python3 bench.py --download-clip          # descarga el modelo CLIP (~300 MB)
+```
+
+El seed por defecto es fijo (`20261101`), así que los números de este README son
+**reproducibles bit a bit** en la misma máquina.
+
+### Límites (léelos antes de citar las cifras)
+
+1. **Las imágenes son sintéticas.** Formas dibujadas con paleta comprimida a
+   propósito, para que el atacante no pueda separar clases por color. Un grid
+   real con fotografías es **más difícil**, no menos.
+2. **El atacante es classical, no moderno.** Los números son un suelo. Con CLIP
+   o un VLM las cifras de grid subirían.
+3. **El lab no valida CAPTCHAs de terceros.** No hay cliente HTTP, ni rotación
+   de token, ni bypass de WAF. Es un banco de pruebas: genera, ataca y mide.
+4. **La distorsión está calibrada contra práctica documentada**, no contra un
+   sitio concreto. Si tienes un despliegue real, mide contra él.
+
+### La línea que este repo no cruza
+
+Un banco que *resuelve* CAPTCHAs de terceros para automatizar spam, registros
+masivos o fraude no es una herramienta de auditoría: es un arma. El marco de este
+proyecto es:
+
+- **Generar** retos propios y medir su resistencia,
+- **Atacar** esos retos para cuantificar el riesgo,
+- **Documentar** qué rompe cada familia y cuánto cuesta,
+- **Medir** detectores de bots y señales de comportamiento.
+
+Todo lo que se publica aquí cabe en un informe de auditoría defendible delante
+de un cliente. Todo lo que no, no cabe — y por eso no está.
+
+---
+
 ## Estructura
 
 ```
@@ -406,10 +593,18 @@ tools/captcha-lab/
 │   ├── auth.py       # tokens de sesión firmados (human vs ai_agent)
 │   ├── render.py     # generador procedural + compositor Pillow
 │   ├── solver.py     # NCC enmascarada sobre FFT
-│   └── server.py     # FastAPI + store + scoring de comportamiento
+│   ├── server.py     # FastAPI + store + scoring de comportamiento
+│   └── families/     # banco multi-tipo (Parte II)
+│       ├── base.py            # contrato Family + utilidades de imagen
+│       ├── harness.py         # runner multi-familia + métricas
+│       ├── text_family.py     # familia A — OCR (RapidOCR)
+│       ├── grid_family.py     # familia C — grid multi-select (Hu moments)
+│       ├── image_family.py    # familia B — imagen única (k-means + formas)
+│       └── clip_classifier.py # atacante CLIP opcional (ONNX, bajo demanda)
+├── bench.py           # runner del banco: sweep, scaling, JSON
 ├── static/           # el widget (HTML/CSS/JS sin framework)
 ├── tests/
-│   ├── test_e2e.py   # 35 aserciones
+│   ├── test_e2e.py   # 40 aserciones (script standalone)
 │   └── test_bot.py   # 5 estrategias de ataque con Playwright
 └── out/              # capturas y reportes
 ```

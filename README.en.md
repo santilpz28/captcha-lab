@@ -22,12 +22,27 @@ The lab has **two halves**, and that is the whole point:
 
 ## What this lab actually proves (with numbers, not opinions)
 
+**Part I — slider (drag-to-fit):**
+
 | Metric | Value | What it means |
 |---|---|---|
 | CV solver | **40/40 exact, 0 px error** | A naive matcher finds the gap every time → position was never the problem |
 | Attacks in production mode | **12/15 blocked** | The 3 that get through are `humanish`: an attack indistinguishable from a person |
 | Attribution | **15/15 → AI AGENT, 0 → HUMAN** | The server knows *who* solved it, using signed tokens |
 | Solver latency | ~120 ms | Fast enough for production... which is exactly why you need the behavioural gate |
+
+**Part II — multi-type bench (text, grid, image):**
+
+| Family | Challenge | Exact | Per unit | Cost |
+|---|---|---|---|---|
+| text | transcribe characters | **87%** | 91% per character | ~2.1 s |
+| grid | select all X (3×3) | **87%** | 96% per cell | 5 ms |
+| image | click the image with X | 33% | 33% | 8 ms |
+
+The Part II finding is not that challenges break — it is that **they break in
+different ways**: text falls to inference cost, grid to combinatorial arithmetic,
+and single-image to segmentation. See
+[Multi-type bench](#part-ii--multi-type-challenge-bench).
 
 The conclusion is uncomfortable, and it is the point of the whole lab:
 
@@ -332,6 +347,176 @@ would-block:          12/15
 
 ---
 
+## Part II — Multi-type challenge bench
+
+The slider answers *one* question: is it hard to find the gap? The answer was
+"no" (40/40, 0 px). But a real CAPTCHA is not only a slider: there is text to
+transcribe, images to click, and grids with multi-select. Each family has a
+different failure arithmetic, and each deserves its own number.
+
+This bench implements **three additional families** with the same minimal contract
+(`generate` → `solve` → `score`), one real attacker per family, and a harness
+that measures them uniformly.
+
+### The shared contract
+
+```python
+class Family(Protocol):
+    name: str
+    def generate(self, seed: int, **kwargs) -> Challenge: ...
+    def solve(self, challenge: Challenge) -> Attempt: ...
+    def score(self, challenge: Challenge, attempt: Attempt) -> bool: ...
+```
+
+`Challenge.truth` **never leaves the server**; `Challenge.public` is the only thing
+that travels to the client. The playing field is identical for every family.
+
+### Measured results
+
+Run with `python3 bench.py --runs 30` (fixed seed `20261101`, 30 challenges per
+family, local CPU, no GPU):
+
+| Family | Challenge | Exact | Per unit | Cost | Attempts to clear |
+|---|---|---|---|---|---|
+| **text** | "type the characters" (4–6) | **87%** | 91% per character | ~2.1 s | **1.2** |
+| **grid** | "select all images with X" (3×3) | **87%** | 96% per cell | **5 ms** | **1.2** |
+| **image** | "click the image with X" (1 image) | 33% | 33% | 8 ms | 3.0 |
+
+Honest reading:
+
+- **text**: breaks in ~1.2 attempts. The cost is OCR inference (~2 s), not
+  engineering. A retry loop clears it in under three seconds.
+- **grid**: same result at 5 ms. Here the cost is the **arithmetic**, not the
+  model — which is why the two numbers look alike: the attacker is cheap,
+  multi-select is not.
+- **image**: 33%. The bottleneck is **not computer vision**, it is
+  *segmentation* (finding the object and classifying it as separate steps). A
+  useful result: it points at where the hard work actually is.
+
+### The distortion sweep (text)
+
+Calibration matters: a distortion nobody ships in production produces numbers
+that say nothing. This table is the bench's central argument.
+
+| Distortion | Exact | Per character | Attempts | Reading |
+|---|---|---|---|---|
+| 0.00 | 83% | 89% | 1.2 | No distortion |
+| 0.15 | 87% | 93% | 1.2 | Light noise |
+| **0.30** | **87%** | **91%** | **1.2** | **Production range** |
+| 0.45 | 77% | 83% | 1.3 | Aggressive |
+| 0.60 | 57% | 81% | 1.8 | Very aggressive |
+| 0.80 | 7% | 33% | 15 | Extreme — breaks the OCR |
+| 1.00 | 10% | 18% | 10 | Extreme |
+
+The reading is not "more distortion is better". It is: **up to ~0.45 the
+challenge is still decorative** (one retry clears it); the real cliff sits
+between 0.45 and 0.6; and above 0.8 the OCR breaks because wave distortion
+destroys the horizontal lines the OCR needs to segment — not because the
+attacker got better, but because the challenge stopped being legible **for
+humans too**.
+
+> **Distortion is not security.** A challenge that a human can barely read and a
+> bot cannot read only protects against the bot that has not learned OCR yet. The
+> first version of this bench defaulted to `distortion=1.0` and published a 13%
+> success rate. That was a *false* number: it described a CAPTCHA nobody would
+> ship. The numbers above come from ranges a real site would use.
+
+### The multi-select arithmetic (grid)
+
+This is the result the whole bench rests on. The attacker holds its per-cell
+precision (~93%) while full-challenge success collapses:
+
+| Target cells | Exact | Per cell | Attempts |
+|---|---|---|---|
+| 1 | 87% | 90% | 1.2 |
+| 2 | 87% | 93% | 1.2 |
+| 3 | 77% | 93% | 1.3 |
+| 4 | 67% | 93% | 1.5 |
+| 5 | 63% | 93% | 1.6 |
+| 6 | 67% | 94% | 1.5 |
+
+**A classifier with 93% per-cell precision only clears the full challenge
+63–67% of the time.** The mechanism is visible in the failure data: of the 4
+failed challenges in the 30-run pass, **all were false positives** — the
+attacker selected cells that did not contain the target. With multi-select,
+every error is paid twice: one too many (false positive), and a correct
+submission requires getting *every* cell right.
+
+This is the audit lesson a client pays for: **raising classifier quality does
+not scale**. A model at 99% per cell still leaves ~6% global deviation on a
+6-cell grid, and that 6% multiplies by however many attempts the attacker is
+willing to make (free, if failure costs nothing). What actually protects you is
+**cost per attempt**, telemetry, and the behavioural gate — not model precision.
+
+### The attackers (and why they are conservative)
+
+| Family | Attacker | Honesty note |
+|---|---|---|
+| text | RapidOCR (PP-OCRv4, ONNX, no API) + preprocessing | A *mundane* attacker. A modern VLM raises the number. |
+| grid | Hu moments + fill ratio + aspect ratio | Deliberately modest. A CNN beats it easily. |
+| image | k-means hue segmentation + shape classifier | The weakest, and that is a finding, not an excuse. |
+| grid (opt-in) | CLIP ViT-B/32 fp16 (ONNX) | 2.7 s/img on CPU → impractical as default. Documented, not the headline number. |
+
+All of them are **conservative**: they describe the *floor* of what a modest
+attacker achieves, not the ceiling. A bench that measures the weakest possible
+attacker exaggerates the challenge's resistance; one that measures the strongest
+inflates the threat. What is reported here is the cheap attacker, which is all
+it takes to break the challenge.
+
+### CLIP: why it is opt-in
+
+CLIP works (own BPE tokenizer, fp16 casts, correct ONNX export inputs), but at
+**2.7 s per image on CPU** — emulated fp16, no acceleration. A 3×3 grid would
+be 24 s. On top of that, over synthetic abstract shapes its confidences sit
+around 0.4–0.5: it **does not discriminate**, because they are not photos. A
+model trained on the real domain is what wins here, and pretending otherwise
+with drawn shapes would be cheating.
+
+The model is downloaded on demand into `~/.cache/captcha-lab/models` (~300 MB)
+and **not versioned**: the repo stays small and the bench degrades gracefully to
+the classical classifiers when the model is absent.
+
+### Running the bench
+
+```bash
+python3 bench.py                          # 30 runs per family
+python3 bench.py --runs 50 --seed 12345   # reproducible with another seed
+python3 bench.py --sweep                  # text distortion table
+python3 bench.py --scaling                # grid target-count curve
+python3 bench.py --json out/bench.json    # machine-readable output
+python3 bench.py --download-clip          # download the CLIP ONNX model (~300 MB)
+```
+
+The default seed is fixed (`20261101`), so the numbers in this README are
+**reproducible bit for bit** on the same machine.
+
+### Limits (read before quoting the figures)
+
+1. **The images are synthetic.** Drawn shapes with a deliberately compressed
+   palette, so the attacker cannot separate classes by colour. A real grid with
+   photographs is **harder**, not easier.
+2. **The attacker is classical, not modern.** These numbers are a floor. With
+   CLIP or a VLM the grid figures would go up.
+3. **The lab does not attack third-party CAPTCHAs.** No HTTP client, no token
+   rotation, no WAF bypass. It is a test bench: it generates, attacks, measures.
+4. **Distortion is calibrated against documented practice**, not against one
+   specific site. If you have a real deployment, measure against it.
+
+### The line this repo does not cross
+
+A bench that *solves* third-party CAPTCHAs to automate spam, mass registration
+or fraud is not an audit tool: it is a weapon. The framing of this project is:
+
+- **Generate** your own challenges and measure their resistance,
+- **Attack** those challenges to quantify the risk,
+- **Document** what breaks each family and at what cost,
+- **Measure** bot detectors and behavioural signals.
+
+Everything published here fits in a defensible client audit report. Everything
+else does not — which is why it is not here.
+
+---
+
 ## Project layout
 
 ```
@@ -341,10 +526,18 @@ captcha-lab/
 │   ├── auth.py       # signed session tokens (human vs ai_agent)
 │   ├── render.py     # procedural generator + Pillow compositor
 │   ├── solver.py     # masked NCC over FFT
-│   └── server.py     # FastAPI + store + behavioural scoring
+│   ├── server.py     # FastAPI + store + behavioural scoring
+│   └── families/     # multi-type bench (Part II)
+│       ├── base.py            # Family contract + image utilities
+│       ├── harness.py         # multi-family runner + metrics
+│       ├── text_family.py     # family A — OCR (RapidOCR)
+│       ├── grid_family.py     # family C — multi-select grid (Hu moments)
+│       ├── image_family.py    # family B — single image (k-means + shapes)
+│       └── clip_classifier.py # optional CLIP attacker (ONNX, on demand)
+├── bench.py           # bench runner: sweep, scaling, JSON
 ├── static/           # the widget (HTML/CSS/JS, no framework)
 ├── tests/
-│   ├── test_e2e.py   # 40 assertions
+│   ├── test_e2e.py   # 40 assertions (standalone script)
 │   └── test_bot.py   # 5 attack strategies with Playwright
 ├── docs/images/      # screenshots
 └── out/              # runtime output (gitignored)
