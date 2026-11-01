@@ -1,0 +1,10 @@
+# Runtime
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pillow>=10.0
+numpy>=1.26
+
+# Testing
+requests>=2.31
+pytest>=8.0
+playwright>=1.42

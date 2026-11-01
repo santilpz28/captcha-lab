@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAPTCHA Lab — slider puzzle generator &amp; tester</title>
+<meta name="description" content="Generate, solve and profile slider-puzzle CAPTCHAs. Security lab for testing bot resistance of drag-to-fit challenges.">
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%231b1b19'/><path d='M9 12h14v8H9z' fill='none' stroke='%23d97706' stroke-width='2'/><circle cx='16' cy='12' r='3' fill='%23d97706'/></svg>">
+</head>
+<body>
+<div class="shell">
+
+  <header class="masthead">
+    <div>
+      <h1><span class="mark">Lab</span> CAPTCHA Slider</h1>
+      <p class="sub">drag-to-fit generator · CV solver · bot-behaviour profiler</p>
+    </div>
+    <nav>
+      <button class="btn btn-ghost" id="btn-stats" type="button">Refresh stats</button>
+      <button class="btn btn-primary" id="btn-new" type="button">New challenge</button>
+    </nav>
+  </header>
+
+  <main class="grid">
+
+    <!-- ================= LEFT COLUMN ================= -->
+    <div>
+      <section class="panel" aria-labelledby="h-widget">
+        <div class="panel-head">
+          <h2 id="h-widget">Challenge widget</h2>
+          <span class="tag" id="challenge-id">no challenge</span>
+        </div>
+
+        <div class="plate" id="plate">
+          <img class="plate-canvas" id="bg-img" alt="CAPTCHA challenge background with a missing puzzle slot" width="320" height="160">
+          <div class="plate-overlay" aria-hidden="true"><div class="grid-lines"></div></div>
+          <img class="plate-piece" id="piece-img" alt="" draggable="false">
+          <span class="plate-size" id="plate-size">320 × 160</span>
+          <span class="plate-tag">registration grid / 40px</span>
+        </div>
+
+        <div class="track" id="track" tabindex="0" role="slider"
+             aria-label="Drag the puzzle piece into the slot"
+             aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+          <div class="track-fill" id="track-fill"></div>
+          <div class="track-hint" id="track-hint">
+            <span class="arrow">›››</span><span>drag the piece into the slot</span>
+          </div>
+          <div class="slider" id="slider" role="presentation">
+            <span class="slider-grip" aria-hidden="true"></span>
+          </div>
+        </div>
+
+        <div class="result" id="result" role="status" aria-live="polite">
+          <span class="dot"></span>
+          <span id="result-text">Awaiting challenge…</span>
+          <span class="spacer" id="result-extra"></span>
+        </div>
+
+        <div class="controls">
+          <button class="btn btn-primary" id="btn-solve" type="button" disabled>
+            Auto-solve (CV) <span class="badge badge-ai">AI</span>
+          </button>
+          <button class="btn" id="btn-fake" type="button" disabled>
+            Submit wrong offset
+          </button>
+          <div class="field">
+            <label for="sel-size">size</label>
+            <select id="sel-size">
+              <option value="240x120">240 × 120</option>
+              <option value="320x160" selected>320 × 160</option>
+              <option value="400x200">400 × 200</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="sel-piece">piece</label>
+            <select id="sel-piece">
+              <option value="34">34 px</option>
+              <option value="46" selected>46 px</option>
+              <option value="58">58 px</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-log">
+        <div class="panel-head">
+          <h2 id="h-log">Event log</h2>
+          <span class="tag">server + client events</span>
+        </div>
+        <div class="log" id="log" role="log" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <!-- ================= RIGHT COLUMN ================= -->
+    <div>
+      <section class="panel" aria-labelledby="h-stats">
+        <div class="panel-head">
+          <h2 id="h-stats">Lab statistics</h2>
+          <span class="tag" id="stats-updated">—</span>
+        </div>
+        <div class="stat-grid" id="stat-grid">
+          <div class="stat"><span class="label">issued</span><span class="value" id="s-issued">0</span></div>
+          <div class="stat"><span class="label">solved</span><span class="value good" id="s-solved">0</span></div>
+          <div class="stat"><span class="label">failed</span><span class="value bad" id="s-failed">0</span></div>
+          <div class="stat"><span class="label">solver calls</span><span class="value" id="s-calls">0</span></div>
+          <div class="stat"><span class="label">solver hits</span><span class="value" id="s-hits">0</span></div>
+          <div class="stat"><span class="label">hit rate</span><span class="value" id="s-rate">—</span></div>
+        </div>
+
+        <div class="actor-split" id="actor-split">
+          <div class="actor actor-human">
+            <span class="actor-label"><span class="badge badge-human">HUMAN</span></span>
+            <span class="actor-value" id="s-human">0</span>
+            <span class="actor-sub" id="s-human-sub">token-signed sessions</span>
+          </div>
+          <div class="actor actor-ai">
+            <span class="actor-label"><span class="badge badge-ai">AI AGENT</span></span>
+            <span class="actor-value" id="s-ai">0</span>
+            <span class="actor-sub" id="s-ai-sub">token-signed sessions</span>
+          </div>
+        </div>
+
+        <dl class="kv" id="kv-config" style="margin-top: var(--s-4)">
+          <dt>tolerance</dt><dd id="k-tol">±6 px</dd>
+          <dt>challenge TTL</dt><dd id="k-ttl">300 s</dd>
+          <dt>active</dt><dd id="k-active">0</dd>
+          <dt>session</dt><dd id="k-session">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel" aria-labelledby="h-readout">
+        <div class="panel-head">
+          <h2 id="h-readout">Solver readout</h2>
+          <span class="tag">server-side CV</span>
+        </div>
+        <div class="readout" id="readout">Run “Auto-solve (CV)” to see the matcher output.
+
+The solver correlates the dragged sprite against the background with a masked normalised cross-correlation (FFT). A hit means the template match found the gap — i.e. the challenge is machine-solvable.</div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-notes">
+        <div class="panel-head">
+          <h2 id="h-notes">How this works</h2>
+          <span class="tag">read me</span>
+        </div>
+        <div class="notes">
+          <p><strong>Generator.</strong> A procedural photo-like background is built from gradients, blobs and two octaves of noise. A jigsaw piece is knocked out of it; the piece sprite is cut from <em>that exact region</em>, so the hole's interior pixels stay pristine.</p>
+          <p><strong>Solver.</strong> The sprite is correlated against the background with a masked NCC over FFT. Because the sprite is literally the gap's texture, the correlation peaks at exactly 1.0 on the true position. This is the attacker view — if it hits, the CAPTCHA is weak.</p>
+          <p><strong>Behaviour profiler.</strong> The verify endpoint scores the drag trace: humans wobble, overshoot and reverse; bots teleport in one step. It also records how many <em>real</em> pointer events the browser saw, so a trace forged over the API is caught even when its path looks human. Attempts scoring below the threshold are rejected with <code>behaviour_rejected</code>; in <strong>LAB mode</strong> they are logged but allowed through, so the tester can measure both numbers.</p>
+          <p><strong>What this is not.</strong> A production CAPTCHA. There is no HMAC-signed answer, no server-side pixel-perfect tolerance tuning, and no rate limiting. It is a bench for measuring and reasoning about slider-CAPTCHA resistance.</p>
+        </div>
+      </section>
+    </div>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
