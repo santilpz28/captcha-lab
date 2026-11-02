@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: lab tests + bench smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Sanity — package imports
+        run: python -c "import app.server; print('imports ok')"
+
+      - name: E2E suite (server, tokens, attribution)
+        run: |
+          python tests/test_e2e.py
+
+      - name: Bench smoke (3 runs per family)
+        run: |
+          python bench.py --runs 3 --json out/bench-ci.json
+        continue-on-error: true
+
+      - name: Upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-ci
+          path: out/bench-ci.json
+          if-no-files-found: ignore

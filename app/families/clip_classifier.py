@@ -8,8 +8,12 @@ This module wraps OpenCLIP ViT-B/32 (ONNX, fp16) so the attacker can answer
 "does this image contain a bus?" the way a modern bot would: embed the image,
 embed the text prompts, compare.
 
+It lives in ``bot/`` because it is part of the **attacker**, not part of the
+challenge generator: the lab may use it to label ground truth, but the bot
+uses it to answer the challenge.
+
 The model is **not vendored** — it is downloaded on first use into
-`~/.cache/captcha-lab/models` (~300 MB). The repo stays small, and the
+``~/.cache/captcha-lab/models`` (~300 MB). The repo stays small, and the
 bench degrades gracefully: without the model, the image/grid families fall
 back to their classical classifiers.
 
@@ -369,3 +373,47 @@ class ClipClassifier:
             i = int(np.argmax(row))
             results.append((self.labels[i], float(probs[i])))
         return results
+
+    def score_labels(self, img: Image.Image) -> list[float]:
+        """Full probability distribution over the label set.
+
+        Needed for multi-select challenges: the attacker must decide
+        whether EACH object matches the target, so it needs the target's
+        own probability — not the argmax label. A scene of dogs must
+        return every dog even when "cat" happens to outrank "dog" on one
+        of them.
+        """
+        rows = self.score_labels_batch([img])
+        return rows[0] if rows else [0.0] * len(self.labels)
+
+    def score_labels_batch(self, imgs: list[Image.Image]) -> list[list[float]]:
+        """Probability distributions for several images in one model call.
+
+        This is the hot path for grid challenges: a 3x3 grid is nine
+        tiles, and one batched forward pass is far cheaper than nine
+        separate ones.
+        """
+        temb = self._embed_text()
+        if temb is None or not imgs:
+            return [[0.0] * len(self.labels) for _ in imgs]
+        sess = _session()
+        vis, _ = sess
+        batch = []
+        for img in imgs:
+            arr = np.asarray(img.convert("RGB").resize((_SIZE, _SIZE),
+                                                       Image.BICUBIC),
+                             dtype=np.float32) / 255.0
+            arr = (arr - _MEAN) / _STD
+            batch.append(arr.transpose(2, 0, 1))
+        x = np.stack(batch).astype(np.float16)
+        name = vis.get_inputs()[0].name
+        out = vis.run(None, {name: x})[0]
+        emb = np.asarray(out, dtype=np.float32)
+        emb = emb / (np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8)
+        sims = emb @ temb.T
+        rows = []
+        for row in sims:
+            probs = np.exp((row - row.max()) * 100.0)
+            probs = probs / probs.sum()
+            rows.append([float(v) for v in probs])
+        return rows

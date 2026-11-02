@@ -62,55 +62,12 @@ TARGETS = list(CLASSES.keys())
 def draw_tile(label: str, size: int = 96, seed: int = 0) -> Image.Image:
     """Draw one synthetic tile containing the given class.
 
-    The background varies per tile (hue, brightness, gradient) so the
-    classifier cannot cheat by key on the background.
+    Delegates to the shared implementation (app/families/shapes.py) —
+    the same code the attacker uses — so both sides measure the same
+    thing.
     """
-    rng = np.random.default_rng(seed)
-    spec = CLASSES[label]
-    base = np.array(spec["color"], dtype=np.float32)
-
-    # Background: a textured field with a per-tile gradient, so the tile is
-    # not a flat colour and the classifier has to look at the shape.
-    bg = np.zeros((size, size, 3), dtype=np.float32)
-    bg[:, :] = 232 - rng.normal(0, 20, (size, size, 1))
-    grad = np.linspace(-18, 18, size)[None, :, None]
-    bg += grad + rng.normal(0, 14, (size, size, 3))
-    img = Image.fromarray(np.clip(bg, 0, 255).astype(np.uint8), "RGB")
-    d = ImageDraw.Draw(img)
-
-    c = tuple(int(v) for v in base)
-    m = size // 2
-    shape = spec["shape"]
-    if shape == "rect":
-        d.rectangle([m - 26, m - 18, m + 26, m + 18], fill=c)
-        d.rectangle([m - 26, m - 18, m + 26, m - 8], fill=tuple(
-            max(0, v - 40) for v in c))
-    elif shape == "rounded":
-        d.rounded_rectangle([m - 26, m - 16, m + 26, m + 18], radius=9, fill=c)
-        d.ellipse([m - 22, m - 8, m + 2, m + 14], fill=tuple(
-            max(0, v - 45) for v in c))
-    elif shape == "hull":
-        d.polygon([(m - 30, m + 14), (m + 30, m + 14), (m + 18, m - 6),
-                   (m - 18, m - 6)], fill=c)
-        d.rectangle([m - 4, m - 24, m + 6, m - 6], fill=c)
-    elif shape == "wheels":
-        d.line([(m - 24, m + 16), (m, m - 8), (m + 24, m + 16)],
-               fill=c, width=5)
-        d.ellipse([m - 32, m + 8, m - 14, m + 26], outline=c, width=5)
-        d.ellipse([m + 14, m + 8, m + 32, m + 26], outline=c, width=5)
-    elif shape == "triangle":
-        d.polygon([(m, m - 26), (m + 26, m + 20), (m - 26, m + 20)], fill=c)
-        d.rectangle([m - 4, m + 18, m + 4, m + 28], fill=tuple(
-            max(0, v - 40) for v in c))
-    elif shape == "wings":
-        d.ellipse([m - 28, m - 14, m + 2, m + 12], fill=c)
-        d.ellipse([m - 2, m - 14, m + 28, m + 12], fill=c)
-        d.ellipse([m - 6, m - 6, m + 6, m + 6], fill=tuple(
-            max(0, v - 50) for v in c))
-
-    # Photographic-ish grain.
-    arr = np.asarray(img, dtype=np.float32) + rng.normal(0, 7, (size, size, 3))
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+    from . import shapes as shapes_mod
+    return shapes_mod.draw_tile(label, size, seed)
 
 
 class GridFamily:
@@ -232,101 +189,32 @@ class GridFamily:
 
     @staticmethod
     def _classify(tile: Image.Image) -> tuple[str, float]:
-        """Classify a tile by the SHAPE of the object in it.
+        """Classify a tile by shape, using the shared implementation.
 
-        The palette is deliberately compressed across classes (see CLASSES),
-        so colour alone cannot separate them — a colour-nearest-neighbour
-        classifier scored 100% on the first version of this bench, which
-        meant it was measuring colour separation, not difficulty.
-
-        The feature vector is deliberately simple and generic:
-          * the shape's relative area,
-          * its aspect ratio and fill ratio (how much of its bounding box
-            it actually covers),
-          * the number of connected components,
-          * Hu moments (rotation/scale invariant shape descriptors).
-
-        Hu moments are the workhorse: they describe shape topology, so a
-        bus (rectangle) and a boat (triangle-ish hull) stay apart even when
-        their colours are nearly identical.
+        One implementation, two consumers: the generator labels ground
+        truth with the same code the attacker uses to guess.
         """
-        arr = np.asarray(tile.convert("RGB"), dtype=np.float32)
-        try:
-            import cv2
-        except ImportError:
-            return TextFallback._classify_colour(tile)
-
-        # Segment the object: the tile background is bright and desaturated,
-        # the object is a saturated blob. Use the distance from the local
-        # background colour.
-        hsv = cv2.cvtColor(np.asarray(tile.convert("RGB")), cv2.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1].astype(np.float32)
-        mask = (sat > 90).astype(np.uint8) * 255
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return TextFallback._classify_colour(tile)
-        cnt = max(cnts, key=cv2.contourArea)
-        area = cv2.contourArea(cnt)
-        if area < 40:
-            return TextFallback._classify_colour(tile)
-
-        x, y, w, h = cv2.boundingRect(cnt)
-        moments = cv2.moments(cnt)
-        hu = cv2.HuMoments(moments).flatten()
-        # Normalise Hu moments so they are scale/translation invariant and
-        # comparable across classes.
-        hu_n = -np.sign(hu) * np.log10(np.abs(hu) + 1e-30)
-
-        feats = np.array([
-            area / (w * h + 1e-6),                       # fill ratio
-            w / (h + 1e-6),                             # aspect ratio
-            float(len(cnts)),                           # component count
-            *hu_n,
-        ], dtype=np.float32)
-        weights = np.array([1.0, 0.25, 0.4] + [2.0] * len(hu_n),
-                            dtype=np.float32)
-
-        def _dist(label: str) -> float:
-            ref = GridFamily._reference_features(label)
-            return float(np.linalg.norm((feats - ref[:len(feats)]) * weights))
-
-        best = min(CLASSES.keys(), key=_dist)
-        ordered = sorted(((l, _dist(l)) for l in CLASSES), key=lambda kv: kv[1])
-        margin = ((ordered[1][1] - ordered[0][1]) / (ordered[0][1] + 1e-6)
-                  if ordered[0][1] > 1e-9 else 1.0)
-        return best, margin
+        from . import shapes as shapes_mod
+        return shapes_mod.classify(
+            tile, references=GridFamily._reference_features_map())
 
     _REF_CACHE: dict = {}
 
     @classmethod
+    def _reference_features_map(cls) -> dict:
+        """Reference shape signatures for every known class."""
+        from . import shapes as shapes_mod
+        if not cls._REF_CACHE:
+            cls._REF_CACHE.update(shapes_mod.reference_signatures())
+        return cls._REF_CACHE
+
+    @classmethod
     def _reference_features(cls, label: str) -> np.ndarray:
         """Shape signature of a class, computed from its canonical drawing."""
-        if label in cls._REF_CACHE:
-            return cls._REF_CACHE[label]
-        import cv2
-        tile = draw_tile(label, 96, seed=0)
-        hsv = cv2.cvtColor(np.asarray(tile.convert("RGB")), cv2.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1].astype(np.float32)
-        mask = (sat > 90).astype(np.uint8) * 255
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-        cnt = max(cnts, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = cv2.contourArea(cnt)
-        moments = cv2.moments(cnt)
-        hu = cv2.HuMoments(moments).flatten()
-        hu_n = -np.sign(hu) * np.log10(np.abs(hu) + 1e-30)
-        feats = np.array([area / (w * h + 1e-6), w / (h + 1e-6),
-                          float(len(cnts)), *hu_n], dtype=np.float32)
-        cls._REF_CACHE[label] = feats
+        from . import shapes as shapes_mod
+        feats = shapes_mod.reference_features(label)
+        if feats is None:
+            raise KeyError(label)
         return feats
 
 

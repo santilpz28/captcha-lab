@@ -35,9 +35,9 @@ The lab has **two halves**, and that is the whole point:
 
 | Family | Challenge | Exact | Per unit | Cost |
 |---|---|---|---|---|
-| text | transcribe characters | **87%** | 91% per character | ~2.1 s |
-| grid | select all X (3×3) | **87%** | 96% per cell | 5 ms |
-| image | click the image with X | 33% | 33% | 8 ms |
+| text | transcribe characters | **77%** | 89% per character | ~2.2 s |
+| grid | select all X (3×3) | **100%** | 100% per cell | ~200 ms |
+| image | click the image with X | **97%** | 97% | ~140 ms |
 
 The Part II finding is not that challenges break — it is that **they break in
 different ways**: text falls to inference cost, grid to combinatorial arithmetic,
@@ -57,6 +57,32 @@ Session tokens are **HMAC-SHA256 signed**, and the type (`human` / `ai_agent`) i
 **inside the signature**: an agent cannot relabel its own token as human. The
 *Auto-solve* button books the resolution as AI even when a person is sitting
 right in front of the browser.
+
+---
+
+## Two repos, two halves
+
+This repo and [`Challenge-captcha`](https://github.com/santilpz28/Challenge-captcha)
+are split on purpose:
+
+| Repo | What it is | What it is NOT |
+|---|---|---|
+| **`captcha-lab`** (this) | The **laboratory**: challenge generator, FastAPI server with UI, human/AI attribution, signed tokens, test bench | Not an attacker |
+| **`Challenge-captcha`** | The **attacker**: solvers, human trace engine, HTTP client, browser mode, segmentation | Not a server, UI or generator |
+
+The reason is methodological: **a bench that ships its own attacker measures
+nothing**. If the generator and the attacker share code, the result says more
+about the shared code than about the difficulty of the challenge.
+
+So the attacker is autonomous: it imports the **contract**
+(`Challenge`/`Attempt`) and nothing else from the generator. And this bench
+calls the real attacker, not a copy of it.
+
+The feature files (Hu moments, reference signatures) and the segmenter exist in
+both repos because **both sides must measure the same thing**: if the generator
+labels ground truth with one classifier and the attacker guesses with another,
+the bench measures the difference between two classifiers instead of the
+difficulty of the challenge.
 
 ---
 
@@ -378,20 +404,78 @@ family, local CPU, no GPU):
 
 | Family | Challenge | Exact | Per unit | Cost | Attempts to clear |
 |---|---|---|---|---|---|
-| **text** | "type the characters" (4–6) | **87%** | 91% per character | ~2.1 s | **1.2** |
-| **grid** | "select all images with X" (3×3) | **87%** | 96% per cell | **5 ms** | **1.2** |
-| **image** | "click the image with X" (1 image) | 33% | 33% | 8 ms | 3.0 |
+| **text** | "type the characters" (4–6) | **77%** | 89% per character | ~2.2 s | **1.3** |
+| **grid** | "select all images with X" (3×3) | **100%** | 100% per cell | ~200 ms | **1.0** |
+| **image** | "click the image with X" (4 objects) | **97%** | 97% | ~140 ms | **1.0** |
 
 Honest reading:
 
-- **text**: breaks in ~1.2 attempts. The cost is OCR inference (~2 s), not
+- **text**: breaks in ~1.3 attempts. The cost is OCR inference (~2 s), not
   engineering. A retry loop clears it in under three seconds.
-- **grid**: same result at 5 ms. Here the cost is the **arithmetic**, not the
-  model — which is why the two numbers look alike: the attacker is cheap,
-  multi-select is not.
-- **image**: 33%. The bottleneck is **not computer vision**, it is
-  *segmentation* (finding the object and classifying it as separate steps). A
-  useful result: it points at where the hard work actually is.
+- **grid**: 100% in a single attempt. Here the cost is the **arithmetic**, not
+  the model.
+- **image**: 97%. It used to be 33%, and the diagnosis was "the bottleneck is
+  segmentation, not computer vision". That was true — see the segmentation
+  section below.
+
+> These numbers come from the **real attacker** (`bot.solvers` in the
+> `Challenge-captcha` repo), not the generator's own solver. Before that
+> correction the bench measured itself: it used the generator's solver, which
+> knows the recipe of the challenge it produced. A benchmark that measures
+> itself measures nothing.
+
+### Segmentation: where the bottleneck was
+
+The image family scored **33%** and the initial diagnosis was "the problem is
+not computer vision, it is segmentation". That was true. Measured four
+strategies over the same 30 scenes:
+
+| Strategy | Recall | Precision | Boxes/scene |
+|---|---|---|---|
+| Saturation threshold | 14% | 26% | 2.6 |
+| Colour clustering (k-means) | 2.5% | 2% | 5.0 |
+| Distance transform + watershed | 0% | 0% | 1.0 |
+| **Masked template matching** | **76%** | **64%** | 4.7 |
+
+Three findings explain the path:
+
+1. **Colour clustering fails because the palette is compressed on purpose.**
+   The lab equalises the tones across classes so colour cannot rule. A
+   colour clusterer has nothing to grip.
+
+2. **The classic watershed fails for a specific reason.** The objects are
+   drawn on RGBA layers and pasted onto the background, so where two overlap
+   the union is one solid region. Its distance transform has **one** peak in
+   the overlap, not one per object, and a watershed cannot separate what the
+   distance already fused.
+
+3. **Template matching works because the challenge has real structure.** Every
+   object is a *known* shape at a *known* size. The template is masked so an
+   object covered by another still correlates on its visible part.
+
+And the fourth, which is the most valuable: **an attacker that knows what it
+is looking for does not need to classify anything**.
+
+| Attack strategy | Accuracy |
+|---|---|
+| Segment everything and classify each object | 53% |
+| **Search directly for the target's template** | **93%** |
+
+The difference is not a better classifier: it is **doing less work**. The
+"segment and classify everything" pipeline pays for every wrong label on
+every distractor. The direct attack asks a narrower question — "where is the
+bus?" — and answers it by correlating only against the bus template.
+
+The fine detail that makes it work: correlation alone **cannot distinguish a
+bus from a car** (0.98410 against 0.98414 on the same cell; they are nearly
+identical rectangles). What distinguishes them is the exact tone of the
+colour: bus is (188, 92, 58) and car is (196, 104, 66). With colour as the
+tie-break, the grid family goes from 70% to **100%**.
+
+> **The transferable lesson:** the strongest attack is not the one that
+> classifies best, it is the one that **asks the least**. And when two things
+> are indistinguishable by shape, look at the colour before inventing more
+> geometry.
 
 ### The distortion sweep (text)
 

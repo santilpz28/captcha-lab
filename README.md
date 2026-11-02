@@ -33,9 +33,9 @@ El lab tiene **dos mitades** y esa es la idea:
 
 | Familia | Reto | Exacto | Por unidad | Coste |
 |---|---|---|---|---|
-| text | transcribir caracteres | **87%** | 91% por carácter | ~2,1 s |
-| grid | seleccionar todas las X (3×3) | **87%** | 96% por celda | 5 ms |
-| image | clic en la imagen con X | 33% | 33% | 8 ms |
+| text | transcribir caracteres | **77%** | 89% por carácter | ~2,1 s |
+| grid | seleccionar todas las X (3×3) | **100%** | 100% por celda | ~200 ms |
+| image | clic en la imagen con X | **97%** | 97% | ~150 ms |
 
 El hallazgo de la Parte II no es que los retos se rompen —es que **se rompen de
 formas distintas**: el texto cae por el coste de inferencia, el grid por la
@@ -54,6 +54,32 @@ La conclusión es incómoda y es el punto de todo el lab:
 Los tokens de sesión van **firmados con HMAC-SHA256** y el tipo (`human` / `ai_agent`)
 está **dentro de la firma**: un agente no puede reetiquetar su token como humano.
 El botón *Auto-solve* marca la resolución como IA aunque haya una persona delante.
+
+---
+
+## Dos repos, dos mitades
+
+Este repo y [`Challenge-captcha`](https://github.com/santilpz28/Challenge-captcha)
+están separados a propósito:
+
+| Repo | Qué es | Qué NO es |
+|---|---|---|
+| **`captcha-lab`** (este) | El **laboratorio**: generador de retos, servidor FastAPI con UI, atribución humano/IA, tokens firmados, banco de pruebas | No es un atacante |
+| **`Challenge-captcha`** | El **atacante**: solvers, motor de trazas humanas, cliente HTTP, modo navegador, segmentación | No es un servidor, ni una UI, ni un generador |
+
+La razón es una, y es metodológica: **un banco de pruebas que incluye su propio
+atacante no mide nada**. Si el generador y el atacante comparten código, el
+resultado dice más sobre el código compartido que sobre la dificultad del reto.
+
+Así que el atacante es autónomo: importa el **contrato** (`Challenge`/`Attempt`)
+y nada más del generador. Y este banco llama al atacante real, no a una copia
+de él.
+
+Los ficheros de features (Hu moments, firmas de referencia) y el segmentador
+existen en los dos repos porque **ambos lados deben medir lo mismo**: si el
+generador etiqueta la verdad con un clasificador y el atacante adivina con
+otro, el banco mediría la diferencia entre dos clasificadores en vez de la
+dificultad del reto.
 
 ---
 
@@ -444,20 +470,78 @@ familia, CPU local, sin GPU):
 
 | Familia | Reto | Exacto | Por unidad | Coste | Intentos para pasar |
 |---|---|---|---|---|---|
-| **text** | "escribe los caracteres" (4–6) | **87%** | 91% por carácter | ~2,1 s | **1,2** |
-| **grid** | "selecciona todas las imágenes con X" (3×3) | **87%** | 96% por celda | **5 ms** | **1,2** |
-| **image** | "haz clic en la imagen con X" (1 imagen) | 33% | 33% | 8 ms | 3,0 |
+| **text** | "escribe los caracteres" (4–6) | **77%** | 89% por carácter | ~2,1 s | **1,3** |
+| **grid** | "selecciona todas las imágenes con X" (3×3) | **100%** | 100% por celda | ~200 ms | **1,0** |
+| **image** | "haz clic en la imagen con X" (4 objetos) | **97%** | 97% | ~150 ms | **1,0** |
 
 Lectura honesta de la tabla:
 
-- **text**: se rompe en ~1,2 intentos. El coste es de inferencia OCR (~2 s), no de
+- **text**: se rompe en ~1,3 intentos. El coste es de inferencia OCR (~2 s), no de
   ingeniería. Un bucle de reintentos lo resuelve en menos de 3 segundos.
-- **grid**: mismo resultado con 5 ms. Aquí el coste es la **aritmética**, no el
-  modelo — y por eso los dos números se parecen: el atacante es barato, la
-  selección múltiple no.
-- **image**: 33%. El cuello de botella **no es la visión artificial**, es la
-  *segmentación* (encontrar el objeto y clasificarlo por separado). Es un
-  resultado útil: señala dónde está el trabajo difícil.
+- **grid**: 100% con 1 intento. Aquí el coste es la **aritmética**, no el modelo.
+- **image**: 97%. Antes de que el atacante fuera autónomo, esta familia daba 33%
+  y el diagnóstico era "el cuello no es la visión, es la segmentación". Lo era:
+  ver [la sección siguiente](#la-segmentación-el-cuello-de-botla) para lo que
+  cuesta arreglarla.
+
+> **Nota sobre qué mide este banco.** Las cifras de arriba las produce el
+> **atacante real** (`bot.solvers` del repo `Challenge-captcha`), no el solver
+> del propio generador. Antes de esa corrección el banco se medía a sí mismo:
+> usaba el solver del generador, que conoce la receta del reto que ha creado.
+> Un banco que se mide a sí mismo no mide nada.
+
+### La segmentación: el cuello de botella de la familia image
+
+La familia image daba **33%** y el diagnóstico inicial era: "el problema no es
+la visión artificial, es la segmentación". Era cierto, y encontrar *por qué*
+requirió medir cuatro estrategias sobre las mismas 30 escenas:
+
+| Estrategia | Recall | Precisión | Cajas/escena |
+|---|---|---|---|
+| Umbral de saturación | 14% | 26% | 2,6 |
+| Clustering de color (k-means) | 2,5% | 2% | 5,0 |
+| Distance transform + watershed | 0% | 0% | 1,0 |
+| **Template matching enmascarado** | **76%** | **64%** | 4,7 |
+
+Tres hallazgos que explican el camino:
+
+1. **El clustering de color falla porque la paleta está comprimida a propósito.**
+   El lab iguala los tonos entre clases para que el color no regule. Un
+   agrupador por color no tiene nada que agarrar.
+
+2. **El watershed clásico falla por una razón concreta.** Los objetos se dibujan
+   sobre capas RGBA y se pegan sobre el fondo, así que donde dos se solapan la
+   unión es una región sólida. Su transformada de distancia tiene **un** pico en
+   el solape, no uno por objeto. El watershed, que es la respuesta canónica,
+   no puede separarlos.
+
+3. **El template matching funciona porque el reto tiene estructura real.** Cada
+   objeto es una forma *conocida* de tamaño *conocido*. La plantilla se
+   enmascara para que un objeto tapado por otro siga correlacionando sobre su
+   parte visible.
+
+Y el cuarto, que es el más valioso: **un atacante que sabe qué busca no necesita
+clasificar nada**.
+
+| Estrategia de ataque | Acierto |
+|---|---|
+| Segmentar todo y clasificar cada objeto | 53% |
+| **Buscar directamente la plantilla del target** | **93%** |
+
+La diferencia no es un clasificador mejor: es **hacer menos trabajo**. El
+pipeline "segmento y clasifico todo" paga el coste de cada etiqueta errónea en
+cada distractor. El ataque directo pregunta algo más estrecho —"¿dónde está un
+bus?"— y lo responde correlacionando sólo contra la plantilla del bus.
+
+El detalle fino que hace que funcione: la correlación por sí sola **no
+distingue un bus de un coche** (0,98410 contra 0,98414 en la misma celda; son
+rectángulos casi idénticos). Lo que los distingue es el tono exacto de su
+color: bus es (188, 92, 58) y coche es (196, 104, 66). Con desempate por color,
+la familia grid pasa del 70% al **100%**.
+
+> **La lección transferible:** el ataque más fuerte no es el que clasifica
+> mejor, es el que **pregunta menos**. Y cuando dos cosas son
+> indistinguibles por forma, mira el color antes de inventar más geometría.
 
 ### El sweep de distorsión (texto)
 
